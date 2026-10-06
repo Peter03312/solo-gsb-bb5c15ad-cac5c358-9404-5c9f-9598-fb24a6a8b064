@@ -3,7 +3,8 @@
 基于 **FastAPI + PostgreSQL** 的司机值勤合规核算服务：录入司机与值勤片段（驾驶 / 其他值勤 / 休息），
 按现存记录实时核算两项合规规则，支持按修订号更正、**跨司机值勤批量调整（批次原子提交）**、
 审核发布固化历史版本并与当前结果对照，对当前违规的**告警确认**（片段变更自动失效），
-以及司机违规状态变化时的**订阅通知**（事件与片段变更同事务落库，回调签名投递、失败可重试）。
+司机违规状态变化时的**订阅通知**（事件与片段变更同事务落库，回调签名投递、失败可重试），
+以及**排班试算**：在不写入片段的前提下找出新增一段驾驶/其他值勤的最早可行开始时间。
 
 ## 合规规则
 
@@ -63,6 +64,7 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | PATCH | `/segments/{segment_id}` | 按 `expected_revision` 更正；修订号不符 409；成功后修订号 +1 |
 | GET | `/drivers/{driver_id}/segments` | 司机全部片段（按开始时间排序） |
 | GET | `/drivers/{driver_id}/compliance` | 按现存记录实时重算，返回违规类型 / 首次越限时刻 / 参与片段 |
+| POST | `/drivers/{driver_id}/slot-search` | 排班试算：新增驾驶/其他值勤的最早可行开始时间（只读不写库；已违规不可推荐 / 无解明确返回） |
 | POST | `/drivers/{driver_id}/audits` | 审核发布：固化输入修订与结论；同修订并发/重复发布只留一版（返回既有版本，`created_new=false`） |
 | GET | `/drivers/{driver_id}/audits` | 历史版本列表 |
 | GET | `/drivers/{driver_id}/audits/{audit_id}` | 查看历史版本 |
@@ -269,6 +271,120 @@ curl -s http://localhost:8000/drivers/DRV-1001/acknowledgments/1
 }
 ```
 
+## 排班试算（最早可行开始时间）
+
+排班员可在**不写入片段**的前提下，查询某司机新增一段驾驶/其他值勤的最早可行开始时间：
+`POST /drivers/{driver_id}/slot-search`。
+
+### 试算语义
+
+- 请求体：`type`（`DRIVING` / `OTHER_DUTY`）、`duration_minutes`（**正整数**分钟时长）、
+  `search_start_utc` / `search_end_utc`（带时区的搜索起止，跨度 **≤ 7 天**）。
+- 只考察搜索区间内**整分钟**开始点（起点不足整分钟向上取整；开始点须落在
+  `[search_start_utc, search_end_utc)` 内）；候选片段的**结束可越过区间终点**。
+- 候选与现存片段不重叠（首尾相接 `end == start` 合法）；把候选插入后按两条合规规则
+  重算，仍**完全合规**才可行；按开始时间升序返回首个可行解。
+- 当前结论与全部候选基于**同一次读取**的现存片段集合；响应附所用片段的
+  `(segment_id, revision)`（`basis_segments`）与试算时刻（`evaluated_at`），时间统一 UTC。
+- `status` 三种结论（均为 HTTP 200）：
+  - `FOUND`：`proposal` 给出最早可行起止与插入后的重算结论（完全合规）；
+  - `NOT_RECOMMENDABLE`：现存记录已违规，`current_compliance` 附当前违规明细，不给候选；
+  - `NO_FEASIBLE_SLOT`：搜索区间内无可行解。
+- 本端点**只读**：任何结论都不写库、**不预留时段**；找到候选后仍需走 `POST /segments`
+  正式录入（录入时仍会独立做重叠与参数校验，期间他处变更不会受试算结果保护）。
+- 拒绝情形：司机不存在 404 `driver_not_found`；时长非正、起止无效或缺少时区、
+  搜索跨度超 7 天、类型为 `REST` 均 422 并指明原因。
+
+### 调用示例
+
+```bash
+#  DRV-4004 当天已有：驾驶 08:00-10:00、休息 10:00-10:30（合格休息，清零重计）
+#  找 90 分钟驾驶的最早可行开始 -> FOUND 10:30-12:00（与休息相接合法）
+curl -s -X POST http://localhost:8000/drivers/DRV-4004/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":90,
+       "search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+
+# 现存记录已违规 -> NOT_RECOMMENDABLE（附当前违规明细，不给候选）
+curl -s -X POST http://localhost:8000/drivers/DRV-5005/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":30,
+       "search_start_utc":"2026-10-10T13:00:00Z","search_end_utc":"2026-10-10T20:00:00Z"}'
+
+# 时长本身超过累计驾驶上限（300 分钟 > 4 小时）-> NO_FEASIBLE_SLOT
+curl -s -X POST http://localhost:8000/drivers/DRV-4004/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":300,
+       "search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+
+# 拒绝情形：司机不存在 404；时长非正 / 缺时区 / 跨度超 7 天 / 类型 REST -> 422
+curl -s -X POST http://localhost:8000/drivers/DRV-9999/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":60,
+       "search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+curl -s -X POST http://localhost:8000/drivers/DRV-4004/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":0,
+       "search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+curl -s -X POST http://localhost:8000/drivers/DRV-4004/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":60,
+       "search_start_utc":"2026-10-09T07:00:00","search_end_utc":"2026-10-09T20:00:00Z"}'
+curl -s -X POST http://localhost:8000/drivers/DRV-4004/slot-search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"DRIVING","duration_minutes":60,
+       "search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-17T07:00:00Z"}'
+```
+
+`FOUND` 响应示例：
+
+```json
+{
+  "driver_id": "DRV-4004",
+  "evaluated_at": "2026-10-06T04:00:00Z",
+  "status": "FOUND",
+  "type": "DRIVING",
+  "duration_minutes": 90,
+  "search_start_utc": "2026-10-09T07:00:00Z",
+  "search_end_utc": "2026-10-09T20:00:00Z",
+  "proposal": {
+    "start_utc": "2026-10-09T10:30:00Z",
+    "end_utc": "2026-10-09T12:00:00Z",
+    "trial_compliance": {"compliant": true, "violations": []}
+  },
+  "current_compliance": {"compliant": true, "violations": []},
+  "basis_segments": [
+    {"segment_id": "SEG-P1", "revision": 1},
+    {"segment_id": "SEG-P2", "revision": 1}
+  ]
+}
+```
+
+`NOT_RECOMMENDABLE` 响应示例（现存记录已违规，不给候选）：
+
+```json
+{
+  "driver_id": "DRV-5005",
+  "status": "NOT_RECOMMENDABLE",
+  "proposal": null,
+  "current_compliance": {
+    "compliant": false,
+    "violations": [
+      {
+        "rule": "CONTINUOUS_DRIVING_LIMIT",
+        "first_violation_at": "2026-10-10T12:00:00Z",
+        "segment_ids": ["SEG-Q1", "SEG-Q2"],
+        "detail": {"limit_seconds": 14400, "reset_rule": "连续休息满 1800 秒才清零重计"}
+      }
+    ]
+  },
+  "basis_segments": [
+    {"segment_id": "SEG-Q1", "revision": 1},
+    {"segment_id": "SEG-Q2", "revision": 1}
+  ]
+}
+```
+
 ## 违规事件订阅与可重试通知
 
 调度系统可通过订阅在**司机违规规则集合发生变化**时收到 HTTP 回调通知。
@@ -397,7 +513,7 @@ assert hmac.compare_digest(request.headers["X-Signature"], expected)
 ## 测试
 
 ```bash
-# 本地（合规引擎、批量排布、告警确认与订阅通知的纯逻辑均仅依赖标准库，无第三方依赖也可运行）
+# 本地（合规引擎、批量排布、告警确认、订阅通知与排班试算的纯逻辑均仅依赖标准库，无第三方依赖也可运行）
 python3 -m unittest discover -s tests
 
 # 或在容器内运行完整测试
@@ -416,3 +532,4 @@ docker compose run --rm app python -m pytest -q
 - **并发安全**：所有片段写操作（录入 / 单片段更正 / 批量调整）在事务入口获取同一把 PostgreSQL 事务级咨询锁（`pg_advisory_xact_lock`），写事务因此全局串行，并发批次也无法绕过修订与重叠检查；锁随事务提交/回滚自动释放。批量调整的纯排布逻辑在 `app/reassignment.py` 中独立实现（仅依赖标准库）。
 - **告警确认**：确认创建同样持有该咨询锁，与片段写操作全局串行——失效扫描不会漏掉并发创建中的确认记录。确认记录固化提交时覆盖的片段修订集合与命中违规明细；幂等指纹只含司机、规则与修订集合（不含备注），同集合重复提交返回原记录。所有片段写路径（录入 / 更正 / 批量调整）在同事务内把修订集合不再匹配的活跃确认标记为失效并固化失效原因，确认失效与片段变更同生同死。指纹与失效判定的纯逻辑在 `app/acknowledgment.py` 中独立实现（仅依赖标准库）。
 - **违规事件订阅通知**：三条片段写路径在提交前逐司机比较事务前后的违规规则集合，仅集合变化才生成事件，事件与匹配的活跃订阅的待投递记录都和片段变更**同一事务**落库（失败回滚、幂等重放均不产生事件）。事件序号 `seq` 在咨询锁串行化的写事务内分配，即提交顺序。后台投递器（`app/dispatcher.py`，随应用 lifespan 启停）按（订阅, 司机）分组轮询：组内只投队首、严格保序，组间线程池并行互不阻塞；回调以共享密钥 HMAC-SHA256 签名，超时/非 2xx 记录次数与最近错误并指数退避重试，重试沿用事件 ID；投递结果用条件更新落库（`WHERE status='PENDING'`），订阅停用同事务取消待投递，两路并发也不会出现"已停用仍发送"。订阅匹配、签名、退避等纯逻辑在 `app/notification.py` 中独立实现（仅依赖标准库）。
+- **排班试算**：`POST /drivers/{driver_id}/slot-search` 只读不写库——无事务写入、不取写锁、不预留时段；当前合规结论与全部候选试算基于**同一次读取**的片段集合（响应附 `basis_segments` 所用片段的 ID 与修订号）。候选为搜索区间内的整分钟开始点（结束可越过区间终点）：先按现存片段的空隙扫描跳过一切重叠放置，再把候选插入已排序片段序列用 `evaluate_sorted` 重算两条规则，取首个完全合规者；现存记录已违规直接返回 `NOT_RECOMMENDABLE` 与当前违规明细，不做候选试算。空隙扫描与候选求值的纯逻辑在 `app/slot_search.py` 中独立实现（仅依赖标准库）。

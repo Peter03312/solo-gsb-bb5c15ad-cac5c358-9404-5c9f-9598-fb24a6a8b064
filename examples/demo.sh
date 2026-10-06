@@ -2,6 +2,7 @@
 # 端到端调用示例：录入 -> 幂等/冲突 -> 重叠校验 -> 合规查询 -> 更正 -> 审核发布 -> 历史对照
 #              -> 跨司机批量调整 -> 告警确认（创建/幂等/失效/再确认）
 #              -> 违规事件订阅（登记/事件与投递查询/重试留痕/停用）
+#              -> 排班试算（最早可行开始时间：FOUND / 无解 / 不可推荐 / 参数拒绝，只读不写库）
 # 用法: BASE_URL=http://localhost:8000 ./examples/demo.sh
 # 回调地址可用 CALLBACK_URL 覆盖（默认指向本机 9000 端口，可配合 examples/callback_sink.py）
 set -uo pipefail
@@ -195,3 +196,36 @@ req POST /subscriptions/SUB-DEMO/deactivate
 req POST /subscriptions/SUB-DEMO/deactivate
 req GET '/deliveries?subscription_id=SUB-DEMO'
 req GET '/subscriptions'
+
+echo "########## 28. 排班试算：录入司机与片段（驾驶 08:00-10:00 + 合格休息 10:00-10:30）"
+req POST /drivers '{"driver_id":"DRV-4004","name":"赵六"}'
+req POST /segments '{"segment_id":"SEG-P1","driver_id":"DRV-4004","start_utc":"2026-10-09T08:00:00Z","end_utc":"2026-10-09T10:00:00Z","type":"DRIVING"}'
+req POST /segments '{"segment_id":"SEG-P2","driver_id":"DRV-4004","start_utc":"2026-10-09T10:00:00Z","end_utc":"2026-10-09T10:30:00Z","type":"REST"}'
+
+echo "########## 29. 找 90 分钟驾驶的最早可行开始时间（只读：不写库、不预留时段）"
+req POST /drivers/DRV-4004/slot-search '{"type":"DRIVING","duration_minutes":90,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+# 期望：FOUND，proposal 10:30-12:00（与休息相接合法；合格休息后累计驾驶清零重计），
+#       basis_segments 列出试算所用的 SEG-P1/SEG-P2 及修订号
+echo "---- 只读验证：片段集合与修订号不变（仍只有 SEG-P1/SEG-P2，修订号均为 1）"
+req GET /drivers/DRV-4004/segments
+
+echo "########## 30. 无解与不可推荐（均为 200，不写库）"
+echo "---- 时长本身超过累计驾驶上限（300 分钟 > 4 小时）-> NO_FEASIBLE_SLOT"
+req POST /drivers/DRV-4004/slot-search '{"type":"DRIVING","duration_minutes":300,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+echo "---- 现存记录已违规（DRV-5005 驾驶 08-12 + 12-13，累计 5h 越限）-> NOT_RECOMMENDABLE"
+req POST /drivers '{"driver_id":"DRV-5005","name":"孙七"}'
+req POST /segments '{"segment_id":"SEG-Q1","driver_id":"DRV-5005","start_utc":"2026-10-10T08:00:00Z","end_utc":"2026-10-10T12:00:00Z","type":"DRIVING"}'
+req POST /segments '{"segment_id":"SEG-Q2","driver_id":"DRV-5005","start_utc":"2026-10-10T12:00:00Z","end_utc":"2026-10-10T13:00:00Z","type":"DRIVING"}'
+req POST /drivers/DRV-5005/slot-search '{"type":"DRIVING","duration_minutes":30,"search_start_utc":"2026-10-10T13:00:00Z","search_end_utc":"2026-10-10T20:00:00Z"}'
+# 期望：NOT_RECOMMENDABLE，current_compliance 附当前违规明细，proposal 为 null
+
+echo "########## 31. 试算参数拒绝：404 / 422（司机不存在、非正时长、缺时区、跨度超 7 天、类型 REST）"
+req POST /drivers/DRV-9999/slot-search '{"type":"DRIVING","duration_minutes":60,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+req POST /drivers/DRV-4004/slot-search '{"type":"DRIVING","duration_minutes":0,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+req POST /drivers/DRV-4004/slot-search '{"type":"DRIVING","duration_minutes":60,"search_start_utc":"2026-10-09T07:00:00","search_end_utc":"2026-10-09T20:00:00Z"}'
+req POST /drivers/DRV-4004/slot-search '{"type":"DRIVING","duration_minutes":60,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-17T07:00:00Z"}'
+req POST /drivers/DRV-4004/slot-search '{"type":"REST","duration_minutes":60,"search_start_utc":"2026-10-09T07:00:00Z","search_end_utc":"2026-10-09T20:00:00Z"}'
+
+echo "########## 32. 试算不预留时段：按试算结果正式录入仍走 POST /segments（独立重叠校验）"
+req POST /segments '{"segment_id":"SEG-P3","driver_id":"DRV-4004","start_utc":"2026-10-09T10:30:00Z","end_utc":"2026-10-09T12:00:00Z","type":"DRIVING"}'
+req GET /drivers/DRV-4004/compliance

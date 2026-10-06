@@ -1,13 +1,13 @@
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import models, notification, schemas
+from . import models, notification, schemas, slot_search
 from .acknowledgment import (
     STATUS_ACTIVE,
     STATUS_INVALIDATED,
@@ -574,6 +574,80 @@ def get_compliance(driver_id: str, db: Session = Depends(get_db)):
         evaluated_at=datetime.now(timezone.utc),
         compliant=result["compliant"],
         violations=result["violations"],
+    )
+
+
+# ---------------------------------------------------------------- 排班试算
+
+@router.post(
+    "/drivers/{driver_id}/slot-search",
+    response_model=schemas.SlotSearchOut,
+    tags=["slot-search"],
+)
+def search_earliest_slot(
+    driver_id: str, body: schemas.SlotSearchCreate, db: Session = Depends(get_db)
+):
+    """排班试算：找出新增一段驾驶/其他值勤的最早可行开始时间（**只读**：不写库、不预留时段）。
+
+    - 只考察搜索区间内**整分钟**开始点，候选结束可越过区间终点；
+      候选与现存片段不重叠（首尾相接合法），插入后按两条合规规则重算仍完全合规。
+    - 当前结论与全部候选基于**同一次读取**的现存片段集合；
+      响应附所用片段的 ``(segment_id, revision)``。
+    - 现存记录已违规：返回 ``NOT_RECOMMENDABLE`` 与当前违规明细，不给候选；
+      搜索区间无解：返回 ``NO_FEASIBLE_SLOT``。两种情况的 HTTP 状态均为 200。
+    - 司机不存在 404 ``driver_not_found``；时长非正、起止无效/缺时区、
+      跨度超 7 天、类型非驾驶/其他值勤均 422。
+    """
+    if db.get(models.Driver, driver_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "driver_not_found",
+                "message": f"司机 '{driver_id}' 不存在",
+                "driver_id": driver_id,
+            },
+        )
+
+    # 同一次读取的现存片段集合：当前结论与全部候选试算都基于它（本端点无任何写入）
+    segs = _driver_segments(db, driver_id)
+    views = [_to_seg(s) for s in segs]
+    evaluated_at = datetime.now(timezone.utc)
+    current = evaluate_driver(views)
+    basis = revision_set((s.segment_id, s.revision) for s in segs)
+
+    status = schemas.SlotSearchStatus.FOUND
+    proposal: schemas.SlotProposalOut | None = None
+    if not current["compliant"]:
+        # 现存记录已违规：返回当前违规及不可推荐状态，不做候选试算
+        status = schemas.SlotSearchStatus.NOT_RECOMMENDABLE
+    else:
+        found = slot_search.find_earliest_slot(
+            views,
+            body.type.value,
+            timedelta(minutes=body.duration_minutes),
+            body.search_start_utc,
+            body.search_end_utc,
+        )
+        if found is None:
+            status = schemas.SlotSearchStatus.NO_FEASIBLE_SLOT
+        else:
+            proposal = schemas.SlotProposalOut(
+                start_utc=found.start,
+                end_utc=found.end,
+                trial_compliance=found.trial_result,
+            )
+
+    return schemas.SlotSearchOut(
+        driver_id=driver_id,
+        evaluated_at=evaluated_at,
+        status=status.value,
+        type=body.type.value,
+        duration_minutes=body.duration_minutes,
+        search_start_utc=body.search_start_utc,
+        search_end_utc=body.search_end_utc,
+        proposal=proposal,
+        current_compliance=current,
+        basis_segments=basis,
     )
 
 

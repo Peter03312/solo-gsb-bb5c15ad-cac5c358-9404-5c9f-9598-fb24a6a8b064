@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -335,3 +335,71 @@ class DeliveryOut(BaseModel):
 
 class EventDetailOut(EventOut):
     deliveries: list[DeliveryOut]  # 该事件在各订阅下的投递状态
+
+
+# ------------------------------------------------------------ 排班试算（最早可行开始时间）
+
+# 搜索区间跨度上限（含边界：恰好 7 天合法，超过拒绝）
+SLOT_SEARCH_MAX_SPAN = timedelta(days=7)
+
+
+class DutySegmentType(str, Enum):
+    """可试算新增的片段类型（休息不参与排班试算）。"""
+
+    DRIVING = "DRIVING"
+    OTHER_DUTY = "OTHER_DUTY"
+
+
+class SlotSearchCreate(BaseModel):
+    """排班试算请求：片段类型 + 正整数分钟时长 + 带时区的搜索起止。"""
+
+    type: DutySegmentType
+    # 正整数分钟时长；非正拒绝（422）。上界为防御性限制（约 69 天），
+    # 防止病态输入使 timedelta 溢出，不约束正常排班场景
+    duration_minutes: int = Field(gt=0, le=100000)
+    search_start_utc: datetime
+    search_end_utc: datetime
+
+    @field_validator("search_start_utc", "search_end_utc")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return _aware_utc(v)
+
+    @model_validator(mode="after")
+    def _valid_window(self):
+        if self.search_end_utc <= self.search_start_utc:
+            raise ValueError("search_end_utc 必须晚于 search_start_utc")
+        if self.search_end_utc - self.search_start_utc > SLOT_SEARCH_MAX_SPAN:
+            raise ValueError("搜索跨度不得超过 7 天")
+        return self
+
+
+class SlotSearchStatus(str, Enum):
+    """试算结论状态。"""
+
+    FOUND = "FOUND"  # 找到最早可行开始时间
+    NO_FEASIBLE_SLOT = "NO_FEASIBLE_SLOT"  # 搜索区间内无可行解
+    NOT_RECOMMENDABLE = "NOT_RECOMMENDABLE"  # 现存记录已违规，不可推荐新增
+
+
+class SlotProposalOut(BaseModel):
+    """首个可行解：候选片段起止（UTC）与插入后的重算结论。"""
+
+    start_utc: datetime
+    end_utc: datetime
+    trial_compliance: dict[str, Any]  # 插入候选片段后的重算结论（完全合规才返回）
+
+
+class SlotSearchOut(BaseModel):
+    """排班试算响应（只读：不写库、不预留时段）。"""
+
+    driver_id: str
+    evaluated_at: datetime  # 试算时刻
+    status: str  # FOUND / NO_FEASIBLE_SLOT / NOT_RECOMMENDABLE
+    type: str
+    duration_minutes: int
+    search_start_utc: datetime
+    search_end_utc: datetime
+    proposal: Optional[SlotProposalOut]  # 仅 FOUND 时非空
+    current_compliance: dict[str, Any]  # 现存记录的实时合规结论（违规时附明细）
+    basis_segments: list[InputRevision]  # 试算基于的现存片段 (segment_id, revision)

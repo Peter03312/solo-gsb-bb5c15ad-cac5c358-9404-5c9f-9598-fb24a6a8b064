@@ -50,6 +50,15 @@ class Violation:
 def evaluate(segments: Iterable[Seg]) -> list[Violation]:
     """对同一司机的全部现存片段求值，返回违规列表（可能为空）。"""
     segs = sorted(segments, key=lambda s: (s.start, s.end, s.segment_id))
+    return evaluate_sorted(segs)
+
+
+def evaluate_sorted(segs: list[Seg]) -> list[Violation]:
+    """对**已按 (start, end, segment_id) 排序**的片段求值。
+
+    与 :func:`evaluate` 结果一致；供排班试算等批量场景复用，
+    避免对每个候选重复排序。
+    """
     violations: list[Violation] = []
     rolling = _check_rolling_24h_duty(segs)
     if rolling is not None:
